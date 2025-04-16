@@ -4,98 +4,123 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 import logging
-from typing import Dict, List
+from typing import Optional, Dict
 
 # Load environment variables
 load_dotenv()
 
 class ExchangeDataCollector:
     def __init__(self):
-        self.exchanges: Dict[str, ccxt.Exchange] = {}
-        self.setup_exchanges()
-
-    def setup_exchanges(self):
-        """Initialize connection to multiple exchanges"""
-        exchange_configs = {
-            'binance': {
-                'apiKey': os.getenv('BINANCE_API_KEY'),
-                'secret': os.getenv('BINANCE_SECRET'),
-                'enableRateLimit': True
-            },
-            'kucoin': {
-                'apiKey': os.getenv('KUCOIN_API_KEY'),
-                'secret': os.getenv('KUCOIN_SECRET'),
-                'password': os.getenv('KUCOIN_PASSPHRASE'),
-                'enableRateLimit': True
-            }
-        }
-        
-        for exchange_id, config in exchange_configs.items():
+        self.exchanges = {}
+        self.data_cache = {}
+        self.ticker_cache = {}
+        self.last_ticker_update = {}
+    
+    def _get_exchange(self, exchange_id: str) -> ccxt.Exchange:
+        """Get or create exchange instance"""
+        if exchange_id not in self.exchanges:
             try:
                 exchange_class = getattr(ccxt, exchange_id)
-                # If API keys are not provided, initialize exchange without authentication
-                if not config['apiKey'] or config['apiKey'] == 'your_binance_api_key':
-                    self.exchanges[exchange_id] = exchange_class({
-                        'enableRateLimit': True
-                    })
-                else:
-                    self.exchanges[exchange_id] = exchange_class(config)
-                logging.info(f"Initialized {exchange_id} in {'authenticated' if config['apiKey'] else 'public'} mode")
+                self.exchanges[exchange_id] = exchange_class({
+                    'enableRateLimit': True,
+                    'timeout': 30000,
+                })
             except Exception as e:
                 logging.error(f"Error initializing {exchange_id}: {e}")
-                # Still initialize exchange in public mode if authentication fails
-                try:
-                    self.exchanges[exchange_id] = exchange_class({
-                        'enableRateLimit': True
-                    })
-                    logging.info(f"Initialized {exchange_id} in public mode after auth failure")
-                except Exception as e:
-                    logging.error(f"Failed to initialize {exchange_id} in public mode: {e}")
+                return None
+        return self.exchanges[exchange_id]
 
-    def get_historical_data(self, symbol: str, exchange_id: str, timeframe: str = '5m', days: int = 5) -> pd.DataFrame:
-        """Fetch historical OHLCV data from specified exchange"""
+    def get_historical_data(self, symbol: str, exchange_id: str, 
+                          timeframe: str = '5m', days: int = 5) -> pd.DataFrame:
+        """Fetch historical OHLCV data"""
+        cache_key = f"{exchange_id}_{symbol}_{timeframe}_{days}"
+        
+        # Check cache (valid for 1 minute)
+        if cache_key in self.data_cache:
+            cache_time, df = self.data_cache[cache_key]
+            if (datetime.now() - cache_time).total_seconds() < 60:
+                return df
+
         try:
-            exchange = self.exchanges.get(exchange_id)
+            exchange = self._get_exchange(exchange_id)
             if not exchange:
-                raise ValueError(f"Exchange {exchange_id} not initialized")
+                return pd.DataFrame()
 
-            since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+            # Calculate timeframe in milliseconds
+            timeframe_ms = {
+                '1m': 60000,
+                '5m': 300000,
+                '15m': 900000,
+                '1h': 3600000,
+                '4h': 14400000,
+                '1d': 86400000
+            }
             
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+            
+            # Fetch OHLCV data
+            ohlcv = exchange.fetch_ohlcv(
+                symbol, 
+                timeframe=timeframe,
+                since=since,
+                limit=1000
+            )
+            
+            if not ohlcv:
+                return pd.DataFrame()
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(
+                ohlcv,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            for column in df.columns:
-                df[column] = pd.to_numeric(df[column], errors='coerce')
+            
+            # Cache the result
+            self.data_cache[cache_key] = (datetime.now(), df)
             return df
-
+            
         except Exception as e:
-            logging.error(f"Error fetching data from {exchange_id}: {e}")
+            logging.error(f"Error fetching data for {symbol} on {exchange_id}: {e}")
             return pd.DataFrame()
 
-    def get_ticker(self, symbol: str, exchange_id: str) -> dict:
-        """Get current ticker data from specified exchange"""
+    def get_ticker(self, symbol: str, exchange_id: str) -> Optional[Dict]:
+        """Get current ticker data"""
+        cache_key = f"{exchange_id}_{symbol}"
+        
+        # Check cache (valid for 10 seconds)
+        current_time = datetime.now()
+        if cache_key in self.ticker_cache and cache_key in self.last_ticker_update:
+            if (current_time - self.last_ticker_update[cache_key]).total_seconds() < 10:
+                return self.ticker_cache[cache_key]
+
         try:
-            exchange = self.exchanges.get(exchange_id)
+            exchange = self._get_exchange(exchange_id)
             if not exchange:
-                raise ValueError(f"Exchange {exchange_id} not initialized")
-            
+                return None
+
             ticker = exchange.fetch_ticker(symbol)
-            # Ensure all required fields are present
-            required_fields = ['last', 'ask', 'bid', 'quoteVolume']
-            for field in required_fields:
-                if field not in ticker or ticker[field] is None:
-                    ticker[field] = ticker.get('last', 0)
-            ticker['percentage'] = ticker.get('percentage', 0)
-            
-            return ticker
+            if ticker:
+                self.ticker_cache[cache_key] = ticker
+                self.last_ticker_update[cache_key] = current_time
+                return ticker
+                
         except Exception as e:
-            logging.error(f"Error fetching ticker from {exchange_id}: {e}")
-            # Return a default ticker structure with zeros
-            return {
-                'last': 0,
-                'ask': 0,
-                'bid': 0,
-                'quoteVolume': 0,
-                'percentage': 0
-            }
+            logging.error(f"Error fetching ticker for {symbol} on {exchange_id}: {e}")
+            
+        return None
+
+    def get_orderbook(self, symbol: str, exchange_id: str, limit: int = 20) -> Optional[Dict]:
+        """Get current orderbook"""
+        try:
+            exchange = self._get_exchange(exchange_id)
+            if not exchange:
+                return None
+
+            return exchange.fetch_order_book(symbol, limit=limit)
+            
+        except Exception as e:
+            logging.error(f"Error fetching orderbook for {symbol} on {exchange_id}: {e}")
+            return None

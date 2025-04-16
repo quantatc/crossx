@@ -1,189 +1,286 @@
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from typing import Dict, List
+import pandas_ta as ta
 
 class Strategy:
-    def __init__(self, timeframe: str = '5m'):
-        self.timeframe = timeframe
+    def __init__(self):
+        self.atr_period = 14
+        self.rsi_period = 14
+        self.stop_loss_atr = 2.0
+        self.take_profit_atr = 3.0
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators for the strategy"""
-        # Create a copy to avoid modifying the original dataframe
+        """Calculate technical indicators for analysis"""
+        if df.empty:
+            return df
+            
+        # Create a copy to avoid SettingWithCopyWarning
         df = df.copy()
         
-        # Calculate EMAs
-        df['ema_8'] = ta.ema(df['close'], length=8)
-        df['ema_21'] = ta.ema(df['close'], length=21)
-        df['ema_55'] = ta.ema(df['close'], length=55)
-        
-        # Calculate MACD
-        macd = ta.macd(df['close'])
-        df = pd.concat([df, macd], axis=1)
-        
-        # Calculate RSI
-        df['rsi'] = ta.rsi(df['close'], length=14)
-        
-        # Calculate Bollinger Bands
-        bollinger = ta.bbands(df['close'], length=20)
-        df = pd.concat([df, bollinger], axis=1)
-        
-        # Calculate ADX
-        adx = ta.adx(df['high'], df['low'], df['close'])
-        df = pd.concat([df, adx], axis=1)
+        try:
+            # Moving Averages
+            df['sma_20'] = ta.sma(df['close'], length=20).fillna(df['close'])
+            df['sma_50'] = ta.sma(df['close'], length=50).fillna(df['close'])
+            df['sma_200'] = ta.sma(df['close'], length=200).fillna(df['close'])
+            
+            df['ema_8'] = ta.ema(df['close'], length=8).fillna(df['close'])
+            df['ema_21'] = ta.ema(df['close'], length=21).fillna(df['close'])
+            df['ema_55'] = ta.ema(df['close'], length=55).fillna(df['close'])
+            
+            # RSI
+            df['rsi'] = ta.rsi(df['close'], length=self.rsi_period).fillna(50)
+            
+            # MACD
+            macd = ta.macd(df['close'])
+            if macd is not None:
+                df['macd_line'] = macd['MACD_12_26_9'].fillna(0)
+                df['macd_signal'] = macd['MACDs_12_26_9'].fillna(0)
+                df['macd_hist'] = macd['MACDh_12_26_9'].fillna(0)
+            else:
+                df['macd_line'] = 0
+                df['macd_signal'] = 0
+                df['macd_hist'] = 0
+            
+            # ATR for volatility
+            df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=self.atr_period)
+            df['atr'] = df['atr'].fillna(df['high'] - df['low'])
+            
+            # Bollinger Bands
+            bb = ta.bbands(df['close'])
+            if bb is not None:
+                # Get the first column names that contain upper, middle, and lower
+                bb_cols = bb.columns.tolist()
+                upper_col = next(col for col in bb_cols if 'BBU_' in col)
+                middle_col = next(col for col in bb_cols if 'BBM_' in col)
+                lower_col = next(col for col in bb_cols if 'BBL_' in col)
+                
+                df['bb_upper'] = bb[upper_col].fillna(df['close'])
+                df['bb_middle'] = bb[middle_col].fillna(df['close'])
+                df['bb_lower'] = bb[lower_col].fillna(df['close'])
+            else:
+                df['bb_upper'] = df['close']
+                df['bb_middle'] = df['close']
+                df['bb_lower'] = df['close']
+            
+        except Exception as e:
+            # If any calculation fails, set default values
+            for col in ['sma_20', 'sma_50', 'sma_200', 'ema_8', 'ema_21', 'ema_55']:
+                df[col] = df['close']
+            
+            df['rsi'] = 50
+            df['atr'] = df['high'] - df['low']
+            
+            df['macd_line'] = 0
+            df['macd_signal'] = 0
+            df['macd_hist'] = 0
+            
+            df['bb_upper'] = df['close']
+            df['bb_middle'] = df['close']
+            df['bb_lower'] = df['close']
         
         return df
 
-    def check_entry_conditions(self, df: pd.DataFrame, row_idx: int) -> Tuple[bool, str]:
-        """Check if entry conditions are met for the Moth Scalping strategy"""
-        if row_idx < 55:  # Need enough data for indicators
-            return False, ""
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Generate trading signals based on Moth Scalping strategy"""
+        if df.empty:
+            return df
             
-        row = df.iloc[row_idx]
-        prev_row = df.iloc[row_idx - 1]
-        
-        # Long entry conditions
-        long_conditions = [
-            row['ema_8'] > row['ema_21'],  # Bullish EMA alignment
-            row['ema_21'] > row['ema_55'],
-            row['close'] > row['ema_8'],    # Price above EMA8
-            row['MACD_12_26_9'] > row['MACDs_12_26_9'],  # MACD bullish crossover
-            prev_row['MACD_12_26_9'] <= prev_row['MACDs_12_26_9'],
-            row['rsi'] > 40,                # RSI conditions
-            row['rsi'] < 70,
-            row['ADX_14'] > 25              # Strong trend
-        ]
-        
-        # Short entry conditions
-        short_conditions = [
-            row['ema_8'] < row['ema_21'],  # Bearish EMA alignment
-            row['ema_21'] < row['ema_55'],
-            row['close'] < row['ema_8'],    # Price below EMA8
-            row['MACD_12_26_9'] < row['MACDs_12_26_9'],  # MACD bearish crossover
-            prev_row['MACD_12_26_9'] >= prev_row['MACDs_12_26_9'],
-            row['rsi'] < 60,                # RSI conditions
-            row['rsi'] > 30,
-            row['ADX_14'] > 25              # Strong trend
-        ]
-        
-        if all(long_conditions):
-            return True, "long"
-        elif all(short_conditions):
-            return True, "short"
-            
-        return False, ""
-
-    def check_exit_conditions(self, df: pd.DataFrame, row_idx: int, 
-                            entry_price: float, side: str) -> bool:
-        """Check if exit conditions are met"""
-        if row_idx < 1:
-            return False
-            
-        row = df.iloc[row_idx]
-        
-        # Exit conditions for long positions
-        if side == "long":
-            # Take profit at 1.5% or stop loss at 0.5%
-            current_pnl = (row['close'] - entry_price) / entry_price * 100
-            if current_pnl >= 1.5 or current_pnl <= -0.5:
-                return True
-                
-            # Exit if EMA8 crosses below EMA21
-            if row['ema_8'] < row['ema_21']:
-                return True
-                
-        # Exit conditions for short positions
-        elif side == "short":
-            # Take profit at 1.5% or stop loss at 0.5%
-            current_pnl = (entry_price - row['close']) / entry_price * 100
-            if current_pnl >= 1.5 or current_pnl <= -0.5:
-                return True
-                
-            # Exit if EMA8 crosses above EMA21
-            if row['ema_8'] > row['ema_21']:
-                return True
-                
-        return False
-
-    def backtest(self, df: pd.DataFrame, initial_balance: float = 10000.0, 
-                 risk_per_trade: float = 0.02) -> Dict:
-        """Run backtest simulation of the strategy"""
+        # Create a copy to avoid SettingWithCopyWarning
+        df = df.copy()
         df = self.calculate_indicators(df)
+        
+        # Initialize signal column
+        df['signal'] = 0
+        
+        # Long entry conditions with NaN handling
+        long_condition = (
+            (df['ema_21'] > df['ema_55']) &  # Trend filter
+            (df['close'] > df['ema_21']) &    # Price above EMA21
+            (df['rsi'] > 50) &                # RSI momentum
+            (df['macd_line'] > df['macd_signal'])  # MACD crossover
+        ).fillna(False)
+        
+        # Short entry conditions with NaN handling
+        short_condition = (
+            (df['ema_21'] < df['ema_55']) &  # Trend filter
+            (df['close'] < df['ema_21']) &    # Price below EMA21
+            (df['rsi'] < 50) &                # RSI momentum
+            (df['macd_line'] < df['macd_signal'])  # MACD crossover
+        ).fillna(False)
+        
+        # Set signals
+        df.loc[long_condition, 'signal'] = 1
+        df.loc[short_condition, 'signal'] = -1
+        
+        return df
+
+    def backtest(self, df: pd.DataFrame, initial_balance: float = 10000,
+                risk_per_trade: float = 0.02) -> Dict:
+        """Run backtest simulation"""
+        if df.empty:
+            return {
+                'equity_curve': [initial_balance],
+                'trades': [],
+                'total_return': 0,
+                'win_rate': 0,
+                'total_trades': 0,
+                'max_drawdown': 0
+            }
+        
+        # Create a copy to avoid SettingWithCopyWarning
+        df = df.copy()
+        df = self.generate_signals(df)
         
         balance = initial_balance
         position = None
+        equity_curve = [initial_balance] * len(df)  # Initialize with initial balance for all points
         trades = []
-        equity_curve = [initial_balance]
         
-        for i in range(len(df)):
-            # Check for exit if in position
-            if position:
-                if self.check_exit_conditions(df, i, position['entry_price'], position['side']):
-                    exit_price = df.iloc[i]['close']
-                    pnl = 0
-                    
-                    if position['side'] == 'long':
-                        pnl = (exit_price - position['entry_price']) / position['entry_price']
-                    else:
-                        pnl = (position['entry_price'] - exit_price) / position['entry_price']
-                        
-                    pnl = pnl * position['size'] - (position['size'] * 0.001 * 2)  # Include 0.1% fees
-                    balance += pnl
-                    
-                    trades.append({
-                        'entry_time': df.index[position['entry_index']],
-                        'exit_time': df.index[i],
-                        'side': position['side'],
-                        'entry_price': position['entry_price'],
-                        'exit_price': exit_price,
-                        'pnl': pnl,
-                        'balance': balance
-                    })
-                    
-                    position = None
-                    equity_curve.append(balance)
-                    
-            # Check for entry if not in position
-            else:
-                should_enter, side = self.check_entry_conditions(df, i)
-                if should_enter:
-                    entry_price = df.iloc[i]['close']
-                    position_size = balance * risk_per_trade
-                    
-                    position = {
-                        'side': side,
-                        'entry_price': entry_price,
-                        'entry_index': i,
-                        'size': position_size
-                    }
-        
-        # Calculate performance metrics
-        if not trades:
-            return {
-                'total_trades': 0,
-                'win_rate': 0.0,
-                'profit_factor': 0.0,
-                'total_return': 0.0,
-                'max_drawdown': 0.0,
-                'trades': [],
-                'equity_curve': equity_curve
-            }
+        for i in range(1, len(df)):
+            current_bar = df.iloc[i]
+            prev_bar = df.iloc[i-1]
             
-        wins = len([t for t in trades if t['pnl'] > 0])
-        total_profit = sum([t['pnl'] for t in trades if t['pnl'] > 0])
-        total_loss = abs(sum([t['pnl'] for t in trades if t['pnl'] < 0]))
+            # Skip if no ATR value
+            if pd.isna(current_bar['atr']):
+                continue
+            
+            # Check for position exit
+            if position:
+                # Calculate stop loss and take profit
+                if position['side'] == 'long':
+                    stop_loss = position['entry'] - (position['atr'] * self.stop_loss_atr)
+                    take_profit = position['entry'] + (position['atr'] * self.take_profit_atr)
+                    
+                    # Check if stopped out
+                    if current_bar['low'] <= stop_loss:
+                        pnl = (stop_loss - position['entry']) * position['size']
+                        balance += pnl
+                        trades.append({
+                            'entry_time': position['time'],
+                            'exit_time': current_bar.name,
+                            'side': position['side'],
+                            'entry_price': position['entry'],
+                            'exit_price': stop_loss,
+                            'pnl': pnl,
+                            'balance': balance
+                        })
+                        position = None
+                    
+                    # Check if take profit hit
+                    elif current_bar['high'] >= take_profit:
+                        pnl = (take_profit - position['entry']) * position['size']
+                        balance += pnl
+                        trades.append({
+                            'entry_time': position['time'],
+                            'exit_time': current_bar.name,
+                            'side': position['side'],
+                            'entry_price': position['entry'],
+                            'exit_price': take_profit,
+                            'pnl': pnl,
+                            'balance': balance
+                        })
+                        position = None
+                
+                else:  # Short position
+                    stop_loss = position['entry'] + (position['atr'] * self.stop_loss_atr)
+                    take_profit = position['entry'] - (position['atr'] * self.take_profit_atr)
+                    
+                    # Check if stopped out
+                    if current_bar['high'] >= stop_loss:
+                        pnl = (position['entry'] - stop_loss) * position['size']
+                        balance += pnl
+                        trades.append({
+                            'entry_time': position['time'],
+                            'exit_time': current_bar.name,
+                            'side': position['side'],
+                            'entry_price': position['entry'],
+                            'exit_price': stop_loss,
+                            'pnl': pnl,
+                            'balance': balance
+                        })
+                        position = None
+                    
+                    # Check if take profit hit
+                    elif current_bar['low'] <= take_profit:
+                        pnl = (position['entry'] - take_profit) * position['size']
+                        balance += pnl
+                        trades.append({
+                            'entry_time': position['time'],
+                            'exit_time': current_bar.name,
+                            'side': position['side'],
+                            'entry_price': position['entry'],
+                            'exit_price': take_profit,
+                            'pnl': pnl,
+                            'balance': balance
+                        })
+                        position = None
+            
+            # Check for new position entry
+            if not position and not pd.isna(current_bar['atr']):
+                if current_bar['signal'] == 1:  # Long signal
+                    risk_amount = balance * risk_per_trade
+                    position_size = risk_amount / (current_bar['atr'] * self.stop_loss_atr)
+                    position = {
+                        'side': 'long',
+                        'entry': current_bar['close'],
+                        'time': current_bar.name,
+                        'size': position_size,
+                        'atr': current_bar['atr']
+                    }
+                
+                elif current_bar['signal'] == -1:  # Short signal
+                    risk_amount = balance * risk_per_trade
+                    position_size = risk_amount / (current_bar['atr'] * self.stop_loss_atr)
+                    position = {
+                        'side': 'short',
+                        'entry': current_bar['close'],
+                        'time': current_bar.name,
+                        'size': position_size,
+                        'atr': current_bar['atr']
+                    }
+            
+            # Update equity curve at the current position
+            equity_curve[i] = balance
         
-        equity_series = pd.Series(equity_curve)
-        max_drawdown = ((equity_series.cummax() - equity_series) / 
-                       equity_series.cummax()).max() * 100
+        # Close any open position at the end
+        if position:
+            exit_price = df['close'].iloc[-1]
+            if position['side'] == 'long':
+                pnl = (exit_price - position['entry']) * position['size']
+            else:
+                pnl = (position['entry'] - exit_price) * position['size']
+            
+            balance += pnl
+            trades.append({
+                'entry_time': position['time'],
+                'exit_time': df.index[-1],
+                'side': position['side'],
+                'entry_price': position['entry'],
+                'exit_price': exit_price,
+                'pnl': pnl,
+                'balance': balance
+            })
+            equity_curve[-1] = balance
+        
+        # Calculate metrics
+        total_return = ((balance - initial_balance) / initial_balance) * 100
+        win_trades = sum(1 for t in trades if t['pnl'] > 0)
+        win_rate = (win_trades / len(trades)) * 100 if trades else 0
+        
+        # Calculate max drawdown
+        peak = initial_balance
+        max_drawdown = 0
+        for value in equity_curve:
+            peak = max(peak, value)
+            drawdown = (peak - value) / peak * 100
+            max_drawdown = max(max_drawdown, drawdown)
         
         return {
-            'total_trades': len(trades),
-            'win_rate': wins / len(trades) * 100,
-            'profit_factor': total_profit / total_loss if total_loss > 0 else float('inf'),
-            'total_return': (balance - initial_balance) / initial_balance * 100,
-            'max_drawdown': max_drawdown,
+            'equity_curve': equity_curve,
             'trades': trades,
-            'equity_curve': equity_curve
+            'total_return': total_return,
+            'win_rate': win_rate,
+            'total_trades': len(trades),
+            'max_drawdown': max_drawdown
         }

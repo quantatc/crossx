@@ -175,4 +175,5 @@ cython_debug/
 
 # Project-specific instructions
 copilot-instructions.md
-moth-scalping101.py
+moth-scalping101.md
+copilot-more_instructions.md
